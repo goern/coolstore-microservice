@@ -1,0 +1,69 @@
+---
+- name: Deploy Red Hat Cool Store Microservice Demo, see https://github.com/goern/coolstore-microservice
+  tags:
+    - openshift
+    - coolstore
+    - demo
+
+  hosts: localhost
+  vars: # FIXME DRY
+    openshift_master_url: "https://{{ lookup('env','OCP_MASTER') }}:8443"
+    username: "{{ lookup('env','OCP_USER') }}"
+    password: "{{ lookup('env','OCP_PASSWORD') }}"
+    project_name: "{{ lookup('env','OCP_PROJECT') }}"
+
+  tasks:
+  - name: verify oc version
+    shell: "oc version"
+    register: command_result
+    failed_when:
+      - "'oc v3.3' not in command_result.stdout"
+      - "'openshift v3.3' not in command_result.stdout"
+
+  - name: login to OpenShift as administrator
+    command: "oc login --insecure-skip-tls-verify=true -u {{ username }} -p {{ password }} {{ openshift_master_url }}"
+
+  - name: "make sure to use project {{ project_name }}"
+    command: "oc project {{ project_name }}"
+    register: project_exists
+    ignore_errors: true
+
+  - name: "create project {{ project_name }}"
+    command: "oc new-project {{ project_name }}"
+    when: project_exists | failed
+
+  - name: "Create OpenShift objects for SSL/TLS crypto secrets and associated service account"
+    command: oc create -f ../openshift-templates/secrets/coolstore-secrets.json
+    ignore_errors: true # because the SA may exist
+
+  - name: "Add roles to service account to allow for kubernetes clustering access"
+    command: "oc policy add-role-to-user view system:serviceaccount:{{project_name}}:{{item}} -n {{project_name}}"
+    with_items:
+      - default
+      - sso-service-account
+    ignore_errors: true # because the SA may exist
+
+  - name: "Create and deploy SSO service, wait for it to complete."
+    command: "oc process -f ../openshift-templates/sso-service.json | oc create -f -"
+
+  - name: "Get pod name of sso-service"
+    command: "oc get pods -o name -l application=sso"
+    register: sso_pod_name_command
+    tags:
+      - dev
+
+  - name: "Set fact: sso_pod_name"
+    set_fact:
+      sso_pod_name: "{{sso_pod_name_command.stdout}}"
+    tags:
+      - dev
+
+  - debug: var="{{sso_pod_name}}"
+    tags:
+      - dev
+
+  - name: "Obtain the public key for the automatically-created realm `myrealm`"
+    command: "oc rsh {{sso_pod_name}} sh -c 'curl -sk https://secure-sso.{{OCP_PROJECT}}.svc.cluster.local:8443/auth/realms/myrealm | python -c \"import sys, json; print json.load(sys.stdin)[public_key]\"')"
+    register: sso_public_key_command
+    tags:
+      - dev
